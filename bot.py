@@ -31,134 +31,189 @@ def save_user(uid, user, db):
 def reset_session(user, news_text):
     user["session"] = {"news": news_text, "questions": 0}
 
+def main_keyboard(paid=False):
+    buttons = [
+        [InlineKeyboardButton("Статус", callback_data="status"),
+         InlineKeyboardButton("Новый запрос", callback_data="reset")]
+    ]
+    if not paid:
+        buttons.append([InlineKeyboardButton("Подписка 200 Stars", callback_data="subscribe")])
+    return InlineKeyboardMarkup(buttons)
+
 async def call_genapi(system_prompt, user_message):
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message}
     ]
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(
-            "https://api.gen-api.ru/api/v1/networks/kimi-k2-5",
-            headers={"Authorization": f"Bearer {GENAPI_KEY}", "Content-Type": "application/json"},
-            json={"messages": messages, "is_sync": False, "max_tokens": 2000}
-        )
-        data = r.json()
-        request_id = data.get("request_id")
-        if not request_id:
-            return "Ошибка: не получен ID запроса"
-
-    for _ in range(60):
-        await asyncio.sleep(3)
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"https://api.gen-api.ru/api/v1/request/{request_id}",
-                headers={"Authorization": f"Bearer {GENAPI_KEY}"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.gen-api.ru/api/v1/networks/kimi-k2-5",
+                headers={"Authorization": f"Bearer {GENAPI_KEY}", "Content-Type": "application/json"},
+                json={"messages": messages, "is_sync": False, "max_tokens": 2000}
             )
+            if r.status_code != 200:
+                return f"Ошибка API: статус {r.status_code}"
             data = r.json()
-            status = data.get("status")
-            if status == "success":
-                return data.get("response", {}).get("content", "Пустой ответ")
-            elif status == "error":
-                return "Ошибка генерации"
+            request_id = data.get("request_id")
+            if not request_id:
+                return f"Ошибка: {data.get('message', 'нет request_id')}"
 
-    return "Превышено время ожидания"
+        for attempt in range(40):
+            await asyncio.sleep(4)
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    r = await client.get(
+                        f"https://api.gen-api.ru/api/v1/request/{request_id}",
+                        headers={"Authorization": f"Bearer {GENAPI_KEY}"}
+                    )
+                    if r.status_code != 200:
+                        continue
+                    text = r.text.strip()
+                    if not text:
+                        continue
+                    data = r.json()
+                    status = data.get("status")
+                    if status == "success":
+                        content = data.get("response", {})
+                        if isinstance(content, dict):
+                            return content.get("content") or content.get("text") or str(content)
+                        return str(content)
+                    elif status == "error":
+                        return f"Ошибка генерации: {data.get('message', '')}"
+            except Exception:
+                continue
 
-SYSTEM_ANALYSIS = """Ты — система анализа новостей. Отвечай на русском языке. Структурируй ответ строго так:
+        return "Превышено время ожидания. Попробуй ещё раз."
+    except Exception as e:
+        return f"Ошибка соединения: {str(e)}"
 
-**Вероятность реальности: [X%]**
+SYSTEM_ANALYSIS = """Ты система анализа новостей. Отвечай на русском. Структурируй ответ строго так:
 
-**Верификация:** [подтверждена / частично подтверждена / не подтверждена] — одна фраза
+Вероятность реальности: [X%]
 
-**Контекст:** кто, где, когда, при каких обстоятельствах — 2-3 предложения
+Верификация: [подтверждена / частично / не подтверждена] - одна фраза
 
-**Коррекция формулировки:** если в новости есть упрощения или искажения — укажи. Если всё точно — пропусти.
+Контекст: кто, где, когда - 2-3 предложения
 
-**Противоречия:** альтернативные позиции и критика — кратко по пунктам
+Противоречия: альтернативные позиции - кратко по пунктам
 
-**3 модели развития:**
-— Модель 1 [название] (вероятность X%): причинно-следственная цепочка → итог
-— Модель 2 [название] (вероятность X%): причинно-следственная цепочка → итог
-— Модель 3 [название] (вероятность X%): причинно-следственная цепочка → итог
+3 модели развития:
+- Модель 1 [название] (вероятность X%): цепочка итог
+- Модель 2 [название] (вероятность X%): цепочка итог
+- Модель 3 [название] (вероятность X%): цепочка итог
 
-**Итог:** одна финальная рекомендация — стоит ли строить выводы на этой новости
+Итог: одна рекомендация
 
-Никаких вступлений. Никакого "конечно" и "отличный вопрос"."""
+Никаких вступлений."""
 
-SYSTEM_FOLLOWUP = """Ты — система анализа новостей. Отвечай на русском. Максимум 3-4 предложения. Только факты и логика. Без вступлений."""
+SYSTEM_FOLLOWUP = """Ты система анализа новостей. Отвечай на русском. Максимум 3-4 предложения. Только факты. Без вступлений."""
 
-SYSTEM_SOFT_EXIT = """Ты — система анализа новостей. Отвечай на русском. Максимум 3 предложения.
-В конце — органично, одной фразой — вплети наблюдение про информационную усталость и пользу паузы. Не упоминай лимиты."""
+SYSTEM_SOFT_EXIT = """Ты система анализа новостей. Отвечай на русском. Максимум 3 предложения.
+В конце органично одной фразой вплети мысль про информационную усталость. Не упоминай лимиты."""
 
 async def analyze(news_text, question=None, q_count=0):
     if question is None:
         return await call_genapi(SYSTEM_ANALYSIS, f"Новость:\n{news_text}")
-    else:
-        system = SYSTEM_SOFT_EXIT if q_count >= MAX_QUESTIONS else SYSTEM_FOLLOWUP
-        return await call_genapi(system, f"Контекст — новость:\n{news_text}\n\nВопрос:\n{question}")
+    system = SYSTEM_SOFT_EXIT if q_count >= MAX_QUESTIONS else SYSTEM_FOLLOWUP
+    return await call_genapi(system, f"Контекст:\n{news_text}\n\nВопрос:\n{question}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user, db = get_user(uid)
-    status = "✓ Подписка активна" if user["paid"] else f"Бесплатных анализов: {max(0, FREE_ANALYSES - user['analyses_used'])}/3"
-    kb = [] if user["paid"] else [[InlineKeyboardButton("Подписка — 200 ⭐", callback_data="subscribe")]]
+    left = max(0, FREE_ANALYSES - user["analyses_used"])
+    status = "Подписка активна" if user["paid"] else f"Бесплатных анализов: {left}/3"
     await update.message.reply_text(
-        f"*News Intelligence*\n\nПришли новость — получи разбор.\n\n{status}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb) if kb else None
+        f"News Intelligence\n\nПришли новость получи разбор.\n\n{status}",
+        reply_markup=main_keyboard(user["paid"])
     )
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    user, db = get_user(uid)
+
+    if query.data == "status":
+        left = max(0, FREE_ANALYSES - user["analyses_used"])
+        news = user["session"]["news"]
+        q = user["session"]["questions"]
+        status_text = "Подписка активна" if user["paid"] else f"Бесплатных анализов: {left}/3"
+        session_text = f"Текущая новость: есть ({q}/{MAX_QUESTIONS} вопросов)" if news else "Текущей новости нет"
+        await query.message.reply_text(
+            f"Статус\n\n{status_text}\n{session_text}",
+            reply_markup=main_keyboard(user["paid"])
+        )
+
+    elif query.data == "reset":
+        reset_session(user, None)
+        save_user(uid, user, db)
+        await query.message.reply_text(
+            "Контекст сброшен. Пришли новую новость.",
+            reply_markup=main_keyboard(user["paid"])
+        )
+
+    elif query.data == "subscribe":
+        await context.bot.send_invoice(
+            chat_id=uid,
+            title="News Intelligence подписка",
+            description="Безлимитный анализ новостей на 30 дней",
+            payload="subscription_30d",
+            currency="XTR",
+            prices=[{"label": "Подписка", "amount": 200}]
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user, db = get_user(uid)
-    text = update.message.text.strip()
+    msg = update.message
+
+    is_forward = bool(msg.forward_origin or msg.forward_from or msg.forward_from_chat)
+    text = (msg.text or msg.caption or "").strip()
+
+    if not text:
+        await msg.reply_text("Пришли текст новости.")
+        return
+
     can_use = user["paid"] or user["analyses_used"] < FREE_ANALYSES
     session = user["session"]
 
     is_new_news = (
         session["news"] is None or
+        is_forward or
         len(text) > 150 or
-        not any(w in text.lower() for w in ["почему","как","что","кто","когда","зачем","а если","расскажи","объясни","?","а "])
+        not any(w in text.lower() for w in ["почему","как","что","кто","когда","зачем","а если","расскажи","объясни","?"])
     )
 
     if is_new_news:
         if not can_use:
-            await update.message.reply_text(
-                "Бесплатные разборы закончились.\n\nПодписка — 200 ⭐ в месяц.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Оплатить 200 ⭐", callback_data="subscribe")]])
+            await msg.reply_text(
+                "Бесплатные разборы закончились.",
+                reply_markup=main_keyboard(user["paid"])
             )
             return
         reset_session(user, text)
         if not user["paid"]: user["analyses_used"] += 1
         save_user(uid, user, db)
-        await update.message.reply_chat_action("typing")
-        msg = await update.message.reply_text("Анализирую...")
+        await msg.reply_chat_action("typing")
+        sent = await msg.reply_text("Анализирую... (обычно 30-60 сек)")
         result = await analyze(text)
-        await msg.edit_text(result, parse_mode="Markdown")
+        left = max(0, FREE_ANALYSES - user["analyses_used"])
+        footer = "" if user["paid"] else f"\n\nОсталось анализов: {left}/3"
+        await sent.edit_text(result + footer, reply_markup=main_keyboard(user["paid"]))
     else:
         if session["news"] is None:
-            await update.message.reply_text("Сначала пришли новость.")
+            await msg.reply_text("Сначала пришли новость.", reply_markup=main_keyboard(user["paid"]))
             return
         q_count = session["questions"]
         if q_count >= MAX_QUESTIONS + 1:
             return
         session["questions"] += 1
         save_user(uid, user, db)
-        await update.message.reply_chat_action("typing")
-        msg = await update.message.reply_text("...")
+        await msg.reply_chat_action("typing")
+        sent = await msg.reply_text("...")
         result = await analyze(session["news"], text, q_count)
-        await msg.edit_text(result, parse_mode="Markdown")
-
-async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await context.bot.send_invoice(
-        chat_id=query.from_user.id,
-        title="News Intelligence — подписка",
-        description="Безлимитный анализ новостей на 30 дней",
-        payload="subscription_30d",
-        currency="XTR",
-        prices=[{"label": "Подписка", "amount": 200}]
-    )
+        await sent.edit_text(result, reply_markup=main_keyboard(user["paid"]))
 
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.pre_checkout_query.answer(ok=True)
@@ -168,15 +223,18 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user, db = get_user(uid)
     user["paid"] = True
     save_user(uid, user, db)
-    await update.message.reply_text("✓ Подписка активна\n\nПрисылай любые новости.")
+    await update.message.reply_text(
+        "Подписка активна\n\nПрисылай любые новости.",
+        reply_markup=main_keyboard(True)
+    )
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_subscribe, pattern="subscribe"))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, handle_message))
     app.run_polling()
 
 if __name__ == "__main__":
