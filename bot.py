@@ -1,5 +1,5 @@
 import os, json, asyncio, httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler, CallbackQueryHandler
 
 GENAPI_KEY = os.getenv("GENAPI_KEY", "YOUR_KEY")
@@ -31,14 +31,18 @@ def save_user(uid, user, db):
 def reset_session(user, news_text):
     user["session"] = {"news": news_text, "questions": 0}
 
-def main_keyboard(paid=False):
-    buttons = [
-        [InlineKeyboardButton("Статус", callback_data="status"),
-         InlineKeyboardButton("Новый запрос", callback_data="reset")]
-    ]
+def reply_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("Статус"), KeyboardButton("Новый запрос")]],
+        resize_keyboard=True,
+        persistent=True
+    )
+
+def inline_keyboard(paid=False):
+    buttons = []
     if not paid:
         buttons.append([InlineKeyboardButton("Подписка 200 Stars", callback_data="subscribe")])
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(buttons) if buttons else None
 
 async def call_genapi(system_prompt, user_message):
     messages = [
@@ -91,18 +95,13 @@ async def call_genapi(system_prompt, user_message):
 SYSTEM_ANALYSIS = """Ты система анализа новостей. Отвечай на русском. Структурируй ответ строго так:
 
 Вероятность реальности: [X%]
-
 Верификация: [подтверждена / частично / не подтверждена] - одна фраза
-
 Контекст: кто, где, когда - 2-3 предложения
-
 Противоречия: альтернативные позиции - кратко по пунктам
-
 3 модели развития:
-- Модель 1 [название] (вероятность X%): цепочка итог
-- Модель 2 [название] (вероятность X%): цепочка итог
-- Модель 3 [название] (вероятность X%): цепочка итог
-
+- Модель 1 [название] (вероятность X%): цепочка - итог
+- Модель 2 [название] (вероятность X%): цепочка - итог
+- Модель 3 [название] (вероятность X%): цепочка - итог
 Итог: одна рекомендация
 
 Никаких вступлений."""
@@ -123,37 +122,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, db = get_user(uid)
     left = max(0, FREE_ANALYSES - user["analyses_used"])
     status = "Подписка активна" if user["paid"] else f"Бесплатных анализов: {left}/3"
+    kb = inline_keyboard(user["paid"])
     await update.message.reply_text(
-        f"News Intelligence\n\nПришли новость получи разбор.\n\n{status}",
-        reply_markup=main_keyboard(user["paid"])
+        f"News Intelligence\n\nПришли новость - получи разбор.\n\n{status}",
+        reply_markup=reply_keyboard()
     )
+    if kb:
+        await update.message.reply_text("Оформить подписку:", reply_markup=kb)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
     user, db = get_user(uid)
-
-    if query.data == "status":
-        left = max(0, FREE_ANALYSES - user["analyses_used"])
-        news = user["session"]["news"]
-        q = user["session"]["questions"]
-        status_text = "Подписка активна" if user["paid"] else f"Бесплатных анализов: {left}/3"
-        session_text = f"Текущая новость: есть ({q}/{MAX_QUESTIONS} вопросов)" if news else "Текущей новости нет"
-        await query.message.reply_text(
-            f"Статус\n\n{status_text}\n{session_text}",
-            reply_markup=main_keyboard(user["paid"])
-        )
-
-    elif query.data == "reset":
-        reset_session(user, None)
-        save_user(uid, user, db)
-        await query.message.reply_text(
-            "Контекст сброшен. Пришли новую новость.",
-            reply_markup=main_keyboard(user["paid"])
-        )
-
-    elif query.data == "subscribe":
+    if query.data == "subscribe":
         await context.bot.send_invoice(
             chat_id=uid,
             title="News Intelligence подписка",
@@ -167,12 +149,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user, db = get_user(uid)
     msg = update.message
-
     is_forward = bool(msg.forward_origin or msg.forward_from or msg.forward_from_chat)
     text = (msg.text or msg.caption or "").strip()
 
     if not text:
-        await msg.reply_text("Пришли текст новости.")
+        await msg.reply_text("Пришли текст новости.", reply_markup=reply_keyboard())
+        return
+
+    if text == "Статус":
+        left = max(0, FREE_ANALYSES - user["analyses_used"])
+        news = user["session"]["news"]
+        q = user["session"]["questions"]
+        status_text = "Подписка активна" if user["paid"] else f"Бесплатных анализов: {left}/3"
+        session_text = f"Текущая новость: есть ({q}/{MAX_QUESTIONS} вопросов)" if news else "Текущей новости нет"
+        kb = inline_keyboard(user["paid"])
+        await msg.reply_text(f"Статус\n\n{status_text}\n{session_text}", reply_markup=kb or reply_keyboard())
+        return
+
+    if text == "Новый запрос":
+        reset_session(user, None)
+        save_user(uid, user, db)
+        await msg.reply_text("Контекст сброшен. Пришли новую новость.", reply_markup=reply_keyboard())
         return
 
     can_use = user["paid"] or user["analyses_used"] < FREE_ANALYSES
@@ -187,23 +184,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_new_news:
         if not can_use:
-            await msg.reply_text(
-                "Бесплатные разборы закончились.",
-                reply_markup=main_keyboard(user["paid"])
-            )
+            kb = inline_keyboard(user["paid"])
+            await msg.reply_text("Бесплатные разборы закончились.", reply_markup=kb or reply_keyboard())
             return
         reset_session(user, text)
         if not user["paid"]: user["analyses_used"] += 1
         save_user(uid, user, db)
         await msg.reply_chat_action("typing")
-        sent = await msg.reply_text("Анализирую... (обычно 30-60 сек)")
+        sent = await msg.reply_text("Анализирую... (30-60 сек)")
         result = await analyze(text)
         left = max(0, FREE_ANALYSES - user["analyses_used"])
         footer = "" if user["paid"] else f"\n\nОсталось анализов: {left}/3"
-        await sent.edit_text(result + footer, reply_markup=main_keyboard(user["paid"]))
+        kb = inline_keyboard(user["paid"])
+        await sent.edit_text(result + footer, reply_markup=kb)
     else:
         if session["news"] is None:
-            await msg.reply_text("Сначала пришли новость.", reply_markup=main_keyboard(user["paid"]))
+            await msg.reply_text("Сначала пришли новость.", reply_markup=reply_keyboard())
             return
         q_count = session["questions"]
         if q_count >= MAX_QUESTIONS + 1:
@@ -213,7 +209,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_chat_action("typing")
         sent = await msg.reply_text("...")
         result = await analyze(session["news"], text, q_count)
-        await sent.edit_text(result, reply_markup=main_keyboard(user["paid"]))
+        await sent.edit_text(result)
 
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.pre_checkout_query.answer(ok=True)
@@ -223,10 +219,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user, db = get_user(uid)
     user["paid"] = True
     save_user(uid, user, db)
-    await update.message.reply_text(
-        "Подписка активна\n\nПрисылай любые новости.",
-        reply_markup=main_keyboard(True)
-    )
+    await update.message.reply_text("Подписка активна\n\nПрисылай любые новости.", reply_markup=reply_keyboard())
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -235,7 +228,7 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler((filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
